@@ -24,11 +24,23 @@ def gen_erosion(alpha, min_kernel_size, max_kernel_size):
 
 @torch.inference_mode()
 @safe_autocast_decorator()
-def matanyone(processor, frames_np, mask, r_erode=0, r_dilate=0, n_warmup=10):
+def matanyone(
+    processor,
+    frames_np,
+    mask,
+    r_erode=0,
+    r_dilate=0,
+    n_warmup=10,
+    collect_outputs=True,
+    frame_callback=None,
+):
     """
     Args:
         frames_np: [(H,W,C)]*n, uint8
         mask: (H,W), uint8
+        collect_outputs: whether to keep all output frames in memory
+        frame_callback: optional callback invoked per output frame with
+                        (foreground_frame, alpha_frame)
     Outputs:
         com: [(H,W,C)]*n, uint8
         pha: [(H,W,C)]*n, uint8
@@ -48,8 +60,8 @@ def matanyone(processor, frames_np, mask, r_erode=0, r_dilate=0, n_warmup=10):
 
     frames_np = [frames_np[0]]* n_warmup + frames_np
 
-    frames = []
-    phas = []
+    frames = [] if collect_outputs else None
+    phas = [] if collect_outputs else None
     for ti, frame_single in tqdm.tqdm(enumerate(frames_np)):
         image = to_tensor(frame_single).float().to(device)
 
@@ -70,7 +82,12 @@ def matanyone(processor, frames_np, mask, r_erode=0, r_dilate=0, n_warmup=10):
         
         # DONOT save the warmup frames
         if ti > (n_warmup-1):
-            frames.append((com_np*255).astype(np.uint8))
-            phas.append((pha*255).astype(np.uint8))
+            com_frame = (com_np * 255).astype(np.uint8)
+            pha_frame = (pha * 255).astype(np.uint8)
+            if frame_callback is not None:
+                frame_callback(com_frame, pha_frame)
+            if collect_outputs:
+                frames.append(com_frame)
+                phas.append(pha_frame)
     
     return frames, phas

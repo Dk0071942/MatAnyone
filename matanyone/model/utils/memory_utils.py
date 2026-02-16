@@ -36,22 +36,26 @@ def get_similarity(mk: torch.Tensor,
         qe = qe * uncert_mask
 
     if qe is not None:
-        # See XMem's appendix for derivation
+        # See XMem's appendix for derivation.
+        # Build similarity in-place from `two_ab` to avoid allocating an extra B*N*HW tensor.
         mk = mk.transpose(1, 2)
-        a_sq = (mk.pow(2) @ qe)
+        a_sq = mk.pow(2) @ qe
         two_ab = 2 * (mk @ (qk * qe))
         b_sq = (qe * qk.pow(2)).sum(1, keepdim=True)
-        similarity = (-a_sq + two_ab - b_sq)
+        similarity = two_ab.sub_(a_sq).sub_(b_sq)
     else:
-        # similar to STCN if we don't have the selection term
+        # Similar to STCN if we don't have the selection term.
+        # Reuse `two_ab` as output to reduce peak VRAM.
         a_sq = mk.pow(2).sum(1).unsqueeze(2)
         two_ab = 2 * (mk.transpose(1, 2) @ qk)
-        similarity = (-a_sq + two_ab)
+        similarity = two_ab.sub_(a_sq)
 
+    inv_sqrt_ck = 1.0 / math.sqrt(CK)
     if ms is not None:
-        similarity = similarity * ms / math.sqrt(CK)  # B*N*HW
+        # In-place scaling avoids another full-size temporary allocation.
+        similarity.mul_(ms).mul_(inv_sqrt_ck)  # B*N*HW
     else:
-        similarity = similarity / math.sqrt(CK)  # B*N*HW
+        similarity.mul_(inv_sqrt_ck)  # B*N*HW
 
     return similarity
 

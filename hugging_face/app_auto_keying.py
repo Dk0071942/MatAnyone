@@ -6,10 +6,15 @@ import os
 import json
 import time
 import psutil
+import shutil
 import ffmpeg
 import imageio
 import argparse
+import subprocess
 from PIL import Image
+
+# Reduce CUDA allocator fragmentation for large temporary tensors during inference.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import cv2
 import torch
@@ -28,18 +33,202 @@ from matanyone.inference.inference_core import InferenceCore
 import warnings
 warnings.filterwarnings("ignore")
 
+_VIDEO_CODEC = None
+_FFMPEG_EXE = None
+
+
+def _get_env_port(default_port=8000):
+    """Resolve app port from PORT env var with validation."""
+    env_port = os.getenv("PORT")
+    if env_port is None or env_port == "":
+        return default_port
+
+    try:
+        port = int(env_port)
+    except ValueError as exc:
+        raise ValueError("PORT must be an integer.") from exc
+
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT must be between 1 and 65535.")
+    return port
+
+
 def parse_augment():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--sam_model_type', type=str, default="vit_h")
-    parser.add_argument('--port', type=int, default=8000, help="only useful when running gradio applications")  
+    parser.add_argument('--port', type=int, default=_get_env_port(), help="only useful when running gradio applications")
     parser.add_argument('--mask_save', default=False)
     args = parser.parse_args()
-    
+
+    if not 1 <= args.port <= 65535:
+        raise ValueError("--port must be between 1 and 65535.")
+
     if not args.device:
         args.device = str(get_device())
 
     return args 
+
+
+def _get_ffmpeg_exe():
+    """Resolve ffmpeg executable and force imageio to use the same binary."""
+    global _FFMPEG_EXE
+    if _FFMPEG_EXE is not None:
+        return _FFMPEG_EXE
+
+    ffmpeg_exe = os.getenv("FFMPEG_EXE") or shutil.which("ffmpeg") or "ffmpeg"
+    _FFMPEG_EXE = ffmpeg_exe
+    os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_exe
+    print("[Encoder] imageio ffmpeg executable: {}".format(ffmpeg_exe))
+    return _FFMPEG_EXE
+
+
+def _detect_video_codec():
+    """Use NVENC when available at runtime, otherwise fall back to libx264."""
+    cpu_codec = "libx264"
+    gpu_codec = "h264_nvenc"
+    ffmpeg_exe = _get_ffmpeg_exe()
+
+    try:
+        encoders = subprocess.run(
+            [ffmpeg_exe, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("[Encoder] Using CPU encoder libx264 (failed to query ffmpeg encoders: {}).".format(exc))
+        return cpu_codec
+
+    if gpu_codec not in encoders.stdout:
+        print("[Encoder] Using CPU encoder libx264 (h264_nvenc not present in ffmpeg build).")
+        return cpu_codec
+
+    probe_ok, probe_reason = _probe_encoder_support(gpu_codec, width=640, height=480, fps=30)
+    if probe_ok:
+        print("[Encoder] Using GPU encoder h264_nvenc.")
+        return gpu_codec
+
+    print("[Encoder] Using CPU encoder libx264 (nvenc probe failed: {}).".format(probe_reason))
+    return cpu_codec
+
+
+def _get_video_codec():
+    global _VIDEO_CODEC
+    if _VIDEO_CODEC is None:
+        _VIDEO_CODEC = _detect_video_codec()
+    return _VIDEO_CODEC
+
+
+def _extract_probe_reason(stderr_text):
+    reason_lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+    reason = "unknown reason"
+    priority_markers = (
+        "CUDA_ERROR",
+        "h264_nvenc",
+        "Cannot load libnvidia-encode",
+        "No capable devices found",
+        "Permission denied",
+        "Operation not permitted",
+    )
+    for marker in priority_markers:
+        match = next((line for line in reason_lines if marker in line), None)
+        if match:
+            reason = match
+            break
+    if reason == "unknown reason" and reason_lines:
+        reason = reason_lines[-1]
+    return reason
+
+
+def _probe_encoder_support(codec, width, height, fps):
+    ffmpeg_exe = _get_ffmpeg_exe()
+    fps = int(round(float(fps))) if fps else 30
+    fps = fps if fps > 0 else 30
+    probe_cmd = [
+        ffmpeg_exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s={}x{}:d=1".format(int(width), int(height)),
+        "-r",
+        str(fps),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        codec,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        probe = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+
+    if probe.returncode == 0:
+        return True, ""
+
+    reason_text = (probe.stderr or probe.stdout or "").strip()
+    return False, _extract_probe_reason(reason_text)
+
+
+def _resolve_codec_for_frame_shape(codec, frame_shape, fps):
+    if codec == "libx264" or frame_shape is None:
+        return codec
+
+    height, width = frame_shape[:2]
+    ok, reason = _probe_encoder_support(codec, width=width, height=height, fps=fps)
+    if ok:
+        return codec
+
+    print(
+        "[Encoder] Using CPU encoder libx264 ({} probe failed for {}x{}@{}fps: {}).".format(
+            codec,
+            width,
+            height,
+            int(round(float(fps))) if fps else 30,
+            reason,
+        )
+    )
+    return "libx264"
+
+
+def _open_video_writer(output_path, fps, codec):
+    _get_ffmpeg_exe()
+    writer_kwargs = {
+        "fps": fps,
+        "codec": codec,
+        "macro_block_size": 1,
+    }
+    if codec == "libx264":
+        writer_kwargs["quality"] = 7
+
+    try:
+        return imageio.get_writer(output_path, **writer_kwargs), codec
+    except Exception as exc:
+        if codec != "libx264":
+            print("[Encoder] Failed to initialize {} ({}). Falling back to libx264.".format(codec, exc))
+            return imageio.get_writer(
+                output_path,
+                fps=fps,
+                quality=7,
+                codec="libx264",
+                macro_block_size=1,
+            ), "libx264"
+        raise
 
 # SAM generator
 class MaskGenerator():
@@ -53,6 +242,13 @@ class MaskGenerator():
     
 # convert points input to prompt state
 def get_prompt(click_state, click_input):
+    if not isinstance(click_state, list) or len(click_state) != 2:
+        click_state = [[], []]
+    if not isinstance(click_state[0], list):
+        click_state[0] = list(click_state[0]) if click_state[0] is not None else []
+    if not isinstance(click_state[1], list):
+        click_state[1] = list(click_state[1]) if click_state[1] is not None else []
+
     inputs = json.loads(click_input)
     points = click_state[0]
     labels = click_state[1]
@@ -65,9 +261,44 @@ def get_prompt(click_state, click_input):
         "prompt_type":["click"],
         "input_point":click_state[0],
         "input_label":click_state[1],
-        "multimask_output":"True",
+        "multimask_output": True,
     }
     return prompt
+
+
+def _extract_select_xy(evt):
+    """
+    Normalize gr.Image.select event payload across Gradio versions.
+    Returns (x, y) in image pixel coordinates, or None when unavailable.
+    """
+    if evt is None:
+        return None
+
+    def _coerce_xy(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return int(round(float(value[0]))), int(round(float(value[1])))
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, dict):
+            if "index" in value:
+                return _coerce_xy(value.get("index"))
+            if "x" in value and "y" in value:
+                try:
+                    return int(round(float(value["x"]))), int(round(float(value["y"])))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    xy = _coerce_xy(getattr(evt, "index", None))
+    if xy is not None:
+        return xy
+    xy = _coerce_xy(getattr(evt, "value", None))
+    if xy is not None:
+        return xy
+    return _coerce_xy(getattr(evt, "_data", None))
 
 def get_frames_from_image(image_input, image_state):
     """
@@ -212,11 +443,21 @@ def sam_refine(video_state, point_prompt, click_state, interactive_state, evt:gr
         point_prompt: flag for positive or negative button click
         click_state: [[points], [labels]]
     """
+    click_xy = _extract_select_xy(evt)
+    if click_xy is None:
+        return video_state["painted_images"][video_state["select_frame_number"]], video_state, interactive_state, click_state
+
+    x, y = click_xy
+    frame = video_state["origin_images"][video_state["select_frame_number"]]
+    h, w = frame.shape[:2]
+    x = int(np.clip(x, 0, w - 1))
+    y = int(np.clip(y, 0, h - 1))
+
     if point_prompt == "Positive":
-        coordinate = "[[{},{},1]]".format(evt.index[0], evt.index[1])
+        coordinate = "[[{},{},1]]".format(x, y)
         interactive_state["positive_click_times"] += 1
     else:
-        coordinate = "[[{},{},0]]".format(evt.index[0], evt.index[1])
+        coordinate = "[[{},{},0]]".format(x, y)
         interactive_state["negative_click_times"] += 1
     
     # prompt for sam model
@@ -234,7 +475,7 @@ def sam_refine(video_state, point_prompt, click_state, interactive_state, evt:gr
     video_state["logits"][video_state["select_frame_number"]] = logit
     video_state["painted_images"][video_state["select_frame_number"]] = painted_image
 
-    return painted_image, video_state, interactive_state
+    return painted_image, video_state, interactive_state, click_state
 
 def add_multi_mask(video_state, interactive_state, mask_dropdown):
     mask = video_state["masks"][video_state["select_frame_number"]]
@@ -322,10 +563,55 @@ def video_matting(video_state, interactive_state, mask_dropdown, erode_kernel_si
     # operation error
     if len(np.unique(template_mask))==1:
         template_mask[0][0]=1
-    foreground, alpha = matanyone(matanyone_processor, following_frames, template_mask*255, r_erode=erode_kernel_size, r_dilate=dilate_kernel_size)
+    video_stem = os.path.splitext(video_state["video_name"])[0]
+    foreground_output = "./results/{}_fg.mp4".format(video_stem)
+    alpha_output = "./results/{}_alpha.mp4".format(video_stem)
 
-    foreground_output = generate_video_from_frames(foreground, output_path="./results/{}_fg.mp4".format(video_state["video_name"]), fps=fps, audio_path=audio_path) # import video_input to name the output video
-    alpha_output = generate_video_from_frames(alpha, output_path="./results/{}_alpha.mp4".format(video_state["video_name"]), fps=fps, gray2rgb=True, audio_path=audio_path) # import video_input to name the output video
+    if not os.path.exists("./results"):
+        os.makedirs("./results")
+
+    foreground_temp_path = foreground_output.replace(".mp4", "_temp.mp4")
+    alpha_temp_path = alpha_output.replace(".mp4", "_temp.mp4")
+    frame_shape = following_frames[0].shape if following_frames else None
+    codec = _resolve_codec_for_frame_shape(_get_video_codec(), frame_shape, fps)
+    foreground_writer, codec = _open_video_writer(foreground_temp_path, fps, codec)
+    alpha_writer, codec = _open_video_writer(alpha_temp_path, fps, codec)
+
+    def _write_result_frames(foreground_frame, alpha_frame):
+        alpha_rgb = np.repeat(alpha_frame, 3, axis=2)
+        foreground_writer.append_data(foreground_frame)
+        alpha_writer.append_data(alpha_rgb)
+
+    try:
+        matanyone(
+            matanyone_processor,
+            following_frames,
+            template_mask * 255,
+            r_erode=erode_kernel_size,
+            r_dilate=dilate_kernel_size,
+            collect_outputs=False,
+            frame_callback=_write_result_frames,
+        )
+    finally:
+        foreground_writer.close()
+        alpha_writer.close()
+
+    if audio_path != "" and os.path.exists(audio_path):
+        foreground_with_audio = add_audio_to_video(foreground_temp_path, audio_path, foreground_output)
+        alpha_with_audio = add_audio_to_video(alpha_temp_path, audio_path, alpha_output)
+        if foreground_with_audio:
+            os.remove(foreground_temp_path)
+            foreground_output = foreground_with_audio
+        else:
+            foreground_output = foreground_temp_path
+        if alpha_with_audio:
+            os.remove(alpha_temp_path)
+            alpha_output = alpha_with_audio
+        else:
+            alpha_output = alpha_temp_path
+    else:
+        foreground_output = foreground_temp_path
+        alpha_output = alpha_temp_path
     
     return foreground_output, alpha_output
 
@@ -355,18 +641,22 @@ def generate_video_from_frames(frames, output_path, fps=30, gray2rgb=False, audi
         output_path (str): The path to save the generated video.
         fps (int, optional): The frame rate of the output video. Defaults to 30.
     """
-    frames = torch.from_numpy(np.asarray(frames))
-    _, h, w, _ = frames.shape
-    if gray2rgb:
-        frames = np.repeat(frames, 3, axis=3)
+    if len(frames) == 0:
+        raise ValueError("No frames were provided for video generation.")
 
     if not os.path.exists(os.path.dirname(output_path)):
         os.makedirs(os.path.dirname(output_path))
     video_temp_path = output_path.replace(".mp4", "_temp.mp4")
     
-    # resize back to ensure input resolution
-    imageio.mimwrite(video_temp_path, frames, fps=fps, quality=7, 
-                     codec='libx264', ffmpeg_params=["-vf", f"scale={w}:{h}"])
+    codec = _resolve_codec_for_frame_shape(_get_video_codec(), frames[0].shape, fps)
+    writer, codec = _open_video_writer(video_temp_path, fps, codec)
+    try:
+        for frame in frames:
+            if gray2rgb and frame.shape[-1] == 1:
+                frame = np.repeat(frame, 3, axis=2)
+            writer.append_data(frame)
+    finally:
+        writer.close()
     
     # add audio to video if audio path exists
     if audio_path != "" and os.path.exists(audio_path):
@@ -424,61 +714,10 @@ matanyone_model = get_matanyone_model(ckpt_path, args.device)
 matanyone_model = matanyone_model.to(args.device).eval()
 # matanyone_processor = InferenceCore(matanyone_model, cfg=matanyone_model.cfg)
 
-# download test samples
-test_sample_path = os.path.join('.', "test_sample/")
-load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/test-sample0-720p.mp4', test_sample_path)
-load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/test-sample1-720p.mp4', test_sample_path)
-load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/test-sample2-720p.mp4', test_sample_path)
-load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/test-sample3-720p.mp4', test_sample_path)
-load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/test-sample0.jpg', test_sample_path)
-load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/test-sample1.jpg', test_sample_path)
-
 # download assets
 assets_path = os.path.join('.', "assets/")
 load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/tutorial_single_target.mp4', assets_path)
 load_file_from_url('https://github.com/pq-yang/MatAnyone/releases/download/media/tutorial_multi_targets.mp4', assets_path)
-
-# documents
-title = r"""<div class="multi-layer" align="center"><span>MatAnyone</span></div>
-"""
-description = r"""
-<b>Official Gradio demo</b> for <a href='https://github.com/pq-yang/MatAnyone' target='_blank'><b>MatAnyone: Stable Video Matting with Consistent Memory Propagation</b></a>.<br>
-🔥 MatAnyone is a practical human video matting framework supporting target assignment 🎯.<br>
-🎪 Try to drop your video/image, assign the target masks with a few clicks, and get the the matting results 🤡!<br>
-
-*Note: Due to the online GPU memory constraints, any input with too big resolution will be resized to 1080p.<br>*
-🚀 <b> If you encounter any issue (e.g., frozen video output) or wish to run on higher resolution inputs, please consider <u>duplicating this space</u> or 
-<u>launching the <a href='https://github.com/pq-yang/MatAnyone?tab=readme-ov-file#-interactive-demo' target='_blank'>demo</a> locally</u> following the GitHub instructions.</b>
-"""
-article = r"""<h3>
-<b>If MatAnyone is helpful, please help to 🌟 the <a href='https://github.com/pq-yang/MatAnyone' target='_blank'>Github Repo</a>. Thanks!</b></h3>
-
----
-
-📑 **Citation**
-<br>
-If our work is useful for your research, please consider citing:
-```bibtex
-@InProceedings{yang2025matanyone,
-     title     = {{MatAnyone}: Stable Video Matting with Consistent Memory Propagation},
-     author    = {Yang, Peiqing and Zhou, Shangchen and Zhao, Jixin and Tao, Qingyi and Loy, Chen Change},
-     booktitle = {arXiv preprint arXiv:2501.14677},
-     year      = {2025}
-}
-```
-📝 **License**
-<br>
-This project is licensed under <a rel="license" href="https://github.com/pq-yang/MatAnyone/blob/main/LICENSE">S-Lab License 1.0</a>. 
-Redistribution and use for non-commercial purposes should follow this license.
-<br>
-📧 **Contact**
-<br>
-If you have any questions, please feel free to reach me out at <b>peiqingyang99@outlook.com</b>.
-<br>
-👏 **Acknowledgement**
-<br>
-This project is built upon [Cutie](https://github.com/hkchengrex/Cutie), with the interactive demo adapted from [ProPainter](https://github.com/sczhou/ProPainter), leveraging segmentation capabilities from [Segment Anything](https://github.com/facebookresearch/segment-anything). Thanks for their awesome works!
-"""
 
 my_custom_css = """
 .gradio-container {width: 85% !important; margin: 0 auto;}
@@ -550,20 +789,6 @@ small {
 """
 
 with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
-    gr.HTML('''
-        <div class="title-container">
-            <h1 class="title is-2 publication-title"
-                style="font-size:50px; font-family: 'Sarpanch', serif; 
-                    background: linear-gradient(to right, #d231d8, #2dc464); 
-                    display: inline-block; -webkit-background-clip: text; 
-                    -webkit-text-fill-color: transparent;">
-                MatAnyone
-            </h1>
-        </div>
-    ''')
-
-    gr.Markdown(description)
-
     with gr.Group(elem_classes="gr-monochrome-group", visible=True):
         with gr.Row():
             with gr.Accordion("📕 Video Tutorial (click to expand)", open=False, elem_classes="custom-bg"):
@@ -610,7 +835,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
 
             with gr.Group(elem_classes="gr-monochrome-group", visible=True):
                 with gr.Row():
-                    with gr.Accordion('MatAnyone Settings (click to expand)', open=False):
+                    with gr.Accordion('Settings (click to expand)', open=False):
                         with gr.Row():
                             erode_kernel_size = gr.Slider(label='Erode Kernel Size',
                                                     minimum=0,
@@ -642,8 +867,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
                                 scale=1)
                             mask_dropdown = gr.Dropdown(multiselect=True, value=[], label="Mask Selection", info="Choose 1~all mask(s) added in Step 2", visible=False)
             
-            gr.Markdown("---")
-
             with gr.Column():
                 # input video
                 with gr.Row(equal_height=True):
@@ -657,7 +880,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
                         extract_frames_button = gr.Button(value="Load Video", interactive=True, elem_classes="new_button")
                     with gr.Column(scale=2):
                         video_info = gr.Textbox(label="Video Info", visible=False)
-                        template_frame = gr.Image(label="Start Frame", type="pil",interactive=True, elem_id="template_frame", visible=False, elem_classes="image")
+                        template_frame = gr.Image(label="Start Frame", type="pil", interactive=True, sources=[], elem_id="template_frame", visible=False, elem_classes="image")
                         with gr.Row(equal_height=True, elem_classes="mask_button_group"):
                             clear_button_click = gr.Button(value="Clear Clicks", interactive=True, visible=False, elem_classes="new_button", min_width=100)
                             add_mask_button = gr.Button(value="Add Mask", interactive=True, visible=False, elem_classes="new_button", min_width=100)
@@ -699,7 +922,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
             template_frame.select(
                 fn=sam_refine,
                 inputs=[video_state, point_prompt, click_state, interactive_state],
-                outputs=[template_frame, video_state, interactive_state]
+                outputs=[template_frame, video_state, interactive_state, click_state]
             )
 
             # add different mask
@@ -767,14 +990,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
                 outputs = [template_frame,click_state],
             )
 
-            # set example
-            gr.Markdown("---")
-            gr.Markdown("## Examples")
-            gr.Examples(
-                examples=[os.path.join(os.path.dirname(__file__), "./test_sample/", test_sample) for test_sample in ["test-sample0-720p.mp4", "test-sample1-720p.mp4", "test-sample2-720p.mp4", "test-sample3-720p.mp4"]],
-                inputs=[video_input],
-            )
-
         with gr.TabItem("Image"):
             click_state = gr.State([[],[]])
 
@@ -839,8 +1054,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
                                 scale=1)
                             mask_dropdown = gr.Dropdown(multiselect=True, value=[], label="Mask Selection", info="Choose 1~all mask(s) added in Step 2", visible=False)
             
-            gr.Markdown("---")
-
             with gr.Column():
                 # input image
                 with gr.Row(equal_height=True):
@@ -854,7 +1067,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
                         extract_frames_button = gr.Button(value="Load Image", interactive=True, elem_classes="new_button")
                     with gr.Column(scale=2):
                         image_info = gr.Textbox(label="Image Info", visible=False)
-                        template_frame = gr.Image(type="pil", label="Start Frame", interactive=True, elem_id="template_frame", visible=False, elem_classes="image")
+                        template_frame = gr.Image(type="pil", label="Start Frame", interactive=True, sources=[], elem_id="template_frame", visible=False, elem_classes="image")
                         with gr.Row(equal_height=True, elem_classes="mask_button_group"):
                             clear_button_click = gr.Button(value="Clear Clicks", interactive=True, visible=False, elem_classes="new_button", min_width=100)
                             add_mask_button = gr.Button(value="Add Mask", interactive=True, visible=False, elem_classes="new_button", min_width=100)
@@ -895,7 +1108,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
             template_frame.select(
                 fn=sam_refine,
                 inputs=[image_state, point_prompt, click_state, interactive_state],
-                outputs=[template_frame, image_state, interactive_state]
+                outputs=[template_frame, image_state, interactive_state, click_state]
             )
 
             # add different mask
@@ -963,15 +1176,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=my_custom_css) as demo:
                 outputs = [template_frame,click_state],
             )
 
-            # set example
-            gr.Markdown("---")
-            gr.Markdown("## Examples")
-            gr.Examples(
-                examples=[os.path.join(os.path.dirname(__file__), "./test_sample/", test_sample) for test_sample in ["test-sample0.jpg", "test-sample1.jpg"]],
-                inputs=[image_input],
-            )
-
-    gr.Markdown(article)
-
 demo.queue()
-demo.launch(debug=True)
+print("Launching MatAnyone Gradio app on 0.0.0.0:{}.".format(args.port))
+demo.launch(server_name="0.0.0.0", server_port=args.port, debug=True)

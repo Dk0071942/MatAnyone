@@ -141,6 +141,13 @@ The results will be saved in the `results` folder, including the foreground outp
 
 ## 🎪 Interactive Demo
 To get rid of the preparation for first-frame segmentation mask, we prepare a gradio demo on [hugging face](https://huggingface.co/spaces/PeiqingYang/MatAnyone) and could also **launch locally**. Just drop your video/image, assign the target masks with a few clicks, and get the the matting results!
+
+### Migration Guide (`app.py` -> `app_auto_keying.py`)
+- Old launch command: `python app.py`
+- New launch command: `python app_auto_keying.py`
+- Docker entrypoint is already updated to `app_auto_keying.py`
+- Update any deployment scripts, process managers, and custom run commands that still reference `app.py`
+
 ```shell
 cd hugging_face
 
@@ -148,7 +155,65 @@ cd hugging_face
 pip3 install -r requirements.txt # FFmpeg required
 
 # launch the demo
-python app.py
+PORT=7860 python app_auto_keying.py
+```
+
+### Run with Docker (env-based port)
+```shell
+# from repo root
+cp .env.example .env
+set -a && source .env && set +a
+
+docker build -t matanyone \
+  --build-arg TORCH_WHEEL_INDEX_URL=${TORCH_WHEEL_INDEX_URL} \
+  --build-arg APP_UID=${APP_UID} \
+  --build-arg APP_GID=${APP_GID} \
+  .
+
+docker run --rm -it \
+  --env-file .env \
+  -p ${PORT}:${PORT} \
+  -v $(pwd)/pretrained_models:/app/pretrained_models \
+  -v $(pwd)/results:/app/hugging_face/results \
+  matanyone
+```
+The app listens on `PORT` (default: `7860`) inside the container.
+The Docker image installs CUDA-enabled PyTorch wheels by default (`cu121`) for GPU inference support.
+If your host has NVIDIA runtime, add `--gpus all` to `docker run` to allow GPU inference and NVENC video encoding.
+The app log will print either `[Encoder] Using GPU encoder h264_nvenc.` or a CPU fallback reason.
+
+### Docker Environment Variables
+- `PORT`: Gradio server port used by the app.
+- `FFMPEG_EXE`: ffmpeg executable used for detection and encoding writes.
+- `IMAGEIO_FFMPEG_EXE`: ffmpeg binary used by `imageio` (keep aligned with `FFMPEG_EXE`).
+- `TORCH_WHEEL_INDEX_URL`: build-time wheel index for torch/torchvision (default CUDA 12.1 index).
+- `APP_UID`: build-time uid for non-root runtime user in the container.
+- `APP_GID`: build-time gid for non-root runtime user in the container.
+
+### Build And Runtime Validation
+```shell
+# verify image build (GPU wheels)
+docker build -t matanyone:test \
+  --build-arg TORCH_WHEEL_INDEX_URL=https://download.pytorch.org/whl/cu121 .
+
+# verify image build (CPU wheels)
+docker build -t matanyone:test-cpu \
+  --build-arg TORCH_WHEEL_INDEX_URL=https://download.pytorch.org/whl/cpu .
+
+# GPU runtime validation
+docker run --rm -it --gpus all --env-file .env \
+  -p ${PORT}:${PORT} \
+  -v $(pwd)/pretrained_models:/app/pretrained_models \
+  -v $(pwd)/results:/app/hugging_face/results \
+  matanyone:test
+
+# CPU runtime validation (force CPU)
+docker run --rm -it --env-file .env \
+  -e CUDA_VISIBLE_DEVICES= \
+  -p ${PORT}:${PORT} \
+  -v $(pwd)/pretrained_models:/app/pretrained_models \
+  -v $(pwd)/results:/app/hugging_face/results \
+  matanyone:test-cpu
 ```
 
 By launching, an interactive interface will appear as follow:

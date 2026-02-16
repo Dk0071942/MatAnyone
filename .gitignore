@@ -1,6 +1,7 @@
 __pycache__/
 .vscode/
 .DS_Store
+.env
 hugging_face/assets/
 results/
 test_sample/

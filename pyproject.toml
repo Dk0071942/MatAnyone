@@ -47,7 +47,7 @@ dependencies = [
   'pyqtdarktheme',
   'imageio == 2.25.0',
   'imageio[ffmpeg]',
-  'huggingface_hub',
+  'huggingface_hub<1.0',
   'safetensors',
 ]
 

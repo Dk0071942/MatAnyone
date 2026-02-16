@@ -1,0 +1,10 @@
+.git
+.gitignore
+.vscode
+__pycache__/
+**/__pycache__/
+*.pyc
+pretrained_models/
+results/
+test_sample/
+hugging_face/assets/

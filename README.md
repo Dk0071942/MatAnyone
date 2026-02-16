@@ -186,9 +186,15 @@ The app log will print either `[Encoder] Using GPU encoder h264_nvenc.` or a CPU
 - `PORT`: Gradio server port used by the app.
 - `FFMPEG_EXE`: ffmpeg executable used for detection and encoding writes.
 - `IMAGEIO_FFMPEG_EXE`: ffmpeg binary used by `imageio` (keep aligned with `FFMPEG_EXE`).
+- `NVIDIA_VISIBLE_DEVICES`: set to `all` for GPU runtime.
+- `NVIDIA_DRIVER_CAPABILITIES`: include `video` (for NVENC), e.g. `compute,utility,video`.
 - `TORCH_WHEEL_INDEX_URL`: build-time wheel index for torch/torchvision (default CUDA 12.1 index).
 - `APP_UID`: build-time uid for non-root runtime user in the container.
 - `APP_GID`: build-time gid for non-root runtime user in the container.
+
+### Coolify GPU/NVENC Notes
+- Ensure GPU is enabled for the service (container must run with NVIDIA runtime).
+- Ensure `NVIDIA_DRIVER_CAPABILITIES` includes `video`; without it, ffmpeg may log `Cannot load libnvidia-encode.so.1` and fall back to CPU `libx264`.
 
 ### Build And Runtime Validation
 ```shell

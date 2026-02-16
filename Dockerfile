@@ -10,6 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     FFMPEG_EXE=/usr/local/bin/ffmpeg \
     IMAGEIO_FFMPEG_EXE=/usr/local/bin/ffmpeg \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
     PORT=7860
 
 WORKDIR /app
